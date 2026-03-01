@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+generate.py
+main.py
+train.py
+tokenizer/
+platform/
+ckpt/
+
+models/deepseek-based
+models/inc-per-token 
+models/moe 
+models/n-llama3
+models/n-gemma3n
+
+pipeline/
+*.zip
