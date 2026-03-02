@@ -1,23 +1,22 @@
-
-
-
-from flax import nnx
-import jax 
+import jax
 import jax.numpy as jnp
+from flax import struct
+from typing_extensions import Callable
 
-from dataclasses import dataclass
+from module.config import LanguageConfig
 
 
-@dataclass(frozen=True)
-class LlamaConfig:
+@struct.dataclass
+class LlamaConfig(LanguageConfig):
+    architecture: str = "LlamaLanguageModel"
     vocab_size: int = 80000
     hidden_size: int = 1024
     intermediate_size: int = 2048
-    act_fn: jax.nn = jax.nn.silu
+    act_fn: str = "silu"
     num_hidden_layers: int = 4
     norm_eps: float = 1e-6
     bias: bool = False
-    dtype: jax.dtypes = jnp.bfloat16
+    dtype: str = "bfloat16"
     use_cache: bool = True
 
     # attn

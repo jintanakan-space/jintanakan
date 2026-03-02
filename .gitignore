@@ -25,3 +25,6 @@ models/n-gemma3n
 
 pipeline/
 *.zip
+
+
+test*

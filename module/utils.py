@@ -1,20 +1,32 @@
-
-
-import jax
-import jax.numpy as jnp
-
-from flax import nnx
-
-from orbax import checkpoint as ocp
+import dataclasses
+import functools
+import json
 from pathlib import Path
 
-import dataclasses
 import cloudpickle
+import jax
+import jax.numpy as jnp
+from flax import nnx, serialization
+from orbax import checkpoint as ocp
+
+
+def get_act_fn(act):
+    if callable(act):
+        return act
+    return getattr(jax.nn, act)
+
+
+def get_dtype(dtype):
+    if callable(dtype):
+        return dtype
+    return getattr(jnp, dtype)
+
 
 def rotate_half(x: jax.Array):
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concat([-x2, x1], axis=-1)
+
 
 def apply_rope(query: jax.Array, key: jax.Array, cos: jax.Array, sin: jax.Array):
     # [B, S, E]
@@ -26,57 +38,77 @@ def apply_rope(query: jax.Array, key: jax.Array, cos: jax.Array, sin: jax.Array)
     return query, key
 
 
+@functools.partial(
+    jax.jit, static_argnames=("temperature", "top_k", "top_p", "repetition_penalty")
+)
+def sample_token(
+    logits, input_ids, key, temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0
+):
+    if temperature == 0.0:
+        return jax.lax.argmax(logits, axis=1, index_dtype=jnp.int32), key
+
+    logits = logits / temperature
+
+    # Repetition Penalty
+    if repetition_penalty != 1.0:
+        score_mask = jax.nn.one_hot(input_ids, logits.shape[-1]).any(axis=1)
+        penalized_logits = jnp.where(
+            logits > 0, logits / repetition_penalty, logits * repetition_penalty
+        )
+        logits = jnp.where(score_mask, penalized_logits, logits)
+
+    # Top-K Sampling
+    if top_k > 0:
+        top_k_vals, _ = jax.lax.top_k(logits, top_k)
+        min_vals = top_k_vals[:, -1:]
+        logits = jnp.where(logits < min_vals, -jnp.inf, logits)
+
+    # Nucleus (Top-P) Sampling
+    if top_p < 1.0:
+        sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
+        sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
+
+        cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
+
+        mask = cumulative_probs > top_p
+        mask = jnp.roll(mask, 1, axis=-1)
+        mask = mask.at[:, 0].set(False)  # Always keep at least the most probable token
+
+        inv_indices = jnp.argsort(sorted_indices, axis=-1)
+        mask_in_original_order = jnp.take_along_axis(mask, inv_indices, axis=-1)
+
+        logits = jnp.where(mask_in_original_order, -jnp.inf, logits)
+
+    key, subkey = jax.random.split(key)
+    result = jax.random.categorical(subkey, logits, axis=-1).astype(jnp.int32)
+    return result, key
+
+
+@nnx.jit
+def _forward_step(model, input_ids, attention_mask, position_ids):
+    return model(input_ids, attention_mask, position_ids)
+
+
 class LanguageModel:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-    
-    def generate(
-        self, 
-        input_ids: jax.Array, 
-        attention_mask: jax.Array, 
-        key: jax.Array | None = None,
-        max_new_tokens: int = 64, 
-        temperature: float = 1.0, 
-        top_p: float = 1.0, 
-        top_k: float = 1.0,
-        eos_token_id: int | None = None
-    ):
-        append_mask = jnp.ones((input_ids.shape[0], 1))
-        
-        # Keep track of which sequences in the batch have hit EOS
-        finished = jnp.zeros((input_ids.shape[0],), dtype=jnp.bool_)
+        self.config = kwargs.get("config", None)
 
-        if key is None:
-            temperature = 0.0
-
-        for _ in range(max_new_tokens):
-            logits = self(input_ids, attention_mask)
-            last_logit = logits[:, -1, :] # shape (B, V)
-
-            if temperature == 0.0:
-                result = jax.lax.argmax(last_logit, axis=1, index_dtype=jnp.int32)
+    def set_config(self, **kwargs):
+        if self.config is not None:
+            if hasattr(self.config, "replace"):
+                self.config = self.config.replace(**kwargs)
             else:
-                last_logit = last_logit / temperature
-                key, subkey = jax.random.split(key)
-                result = jax.random.categorical(subkey, last_logit, axis=-1)
-                
-            result = result.astype(jnp.int32)
-            
-            # If sequence is finished, force padding token if we had one, or just keep EOS
-            if eos_token_id is not None:
-                result = jnp.where(finished, eos_token_id, result)
-                finished = finished | (result == eos_token_id)
-                
-            result = jnp.expand_dims(result, axis=1) # shape (B, 1)
+                for k, v in kwargs.items():
+                    setattr(self.config, k, v)
+            self.kwargs["config"] = self.config
 
-            input_ids = jnp.concat([input_ids, result], axis=-1)
-            if attention_mask is not None:
-                attention_mask = jnp.concat([attention_mask, append_mask], axis=-1)
-                
-            if eos_token_id is not None and jnp.all(finished):
-                break
+    def init_cache(self, batch_size: int, max_seq_len: int):
+        from .cache import KVCacheBase
 
-        return input_ids
+        for _, module in nnx.iter_modules(self):
+            if isinstance(module, KVCacheBase):
+                module.init_cache_state(batch_size, max_seq_len)
 
     def save(self, path: str | Path):
         if isinstance(path, str):
@@ -84,28 +116,27 @@ class LanguageModel:
 
         if not path.is_absolute():
             path = path.resolve()
-        
+
         checkpointer = ocp.StandardCheckpointer()
 
         _, state = nnx.split(self)
-        try: 
+        try:
             arch = type(self)
-            config: dataclasses = self.kwargs.get("config", None)
+            config = getattr(self, "config", self.kwargs.get("config", None))
+
             if config is None:
                 raise Exception(
                     f"config is None type, to resolve this send config instance with super().__init__(config=config)."
                 )
-            
+
             checkpointer.save(path, state)
             checkpointer.wait_until_finished()
 
-            with open(path / "config.bin", "wb") as config_file, \
-                open(path / "arch.bin", "wb") as arch_file:
-                cloudpickle.dump(config, config_file)
-                cloudpickle.dump(arch, arch_file)
+            with open(path / "config.json", "w") as config_file:
+                json.dump(serialization.to_state_dict(config), config_file, indent=2)
 
-            return f"save model path {path}"
-        except Exception as e: 
+            print(f"save model path {path}.")
+        except Exception as e:
             print(e)
 
     @classmethod
@@ -116,19 +147,65 @@ class LanguageModel:
         if not path.is_absolute():
             path = path.resolve()
 
+        import models
+
         if cls is LanguageModel:
-            with open(path / "config.bin", "rb") as config_file, \
-                open(path /  "arch.bin", "rb") as model_file:
-                config = cloudpickle.load(config_file)
-                arch = cloudpickle.load(model_file)
+            with open(path / "config.json", "r") as config_file:
+                config = json.load(config_file)
+
+            arch = config.get("architecture")
+            probably_config_class = arch.split("LanguageModel")[0].strip() + "Config"
+            arch = getattr(models, arch)
 
         else:
             arch = cls
-            with open(path / "config.bin", "rb") as f:
-                config = cloudpickle.load(f)
+            with open(path / "config.json", "r") as config_file:
+                config = json.load(config_file)
+
+            arch_name = config.get("architecture", None)
+            if arch_name is None:
+                arch_name = arch.__name__
+
+            probably_config_class = (
+                arch_name.split("LanguageModel")[0].strip() + "Config"
+            )
+
+        config_class = getattr(models, probably_config_class, None)
+        if probably_config_class is None:
+            from module.config import LanguageConfig
+
+            config_class = LanguageConfig
+
+        config = config_class(**config)
 
         model = nnx.eval_shape(lambda: arch(config=config))
         gdef, abs_state = nnx.split(model)
+
+        mesh = jax.sharding.Mesh(jax.devices(), ("model",))
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("model"))
+
+        def wrap_with_sharding(leaf):
+            # เช็คจำนวนมิติ (Rank) ของตัวแปร
+            rank = len(leaf.shape)
+
+            if rank == 0:
+                # ถ้าเป็น Scalar (เช่น bias หรือ scale บางตัว) ห้ามใส่ชื่อแกน
+                # ใช้ PartitionSpec() เปล่าๆ เพื่อบอกว่า "ไม่ต้อง shard"
+                spec = jax.sharding.PartitionSpec()
+            else:
+                # ถ้ามีตั้งแต่ 1 มิติขึ้นไป ให้แบ่งตามแกน 'model' (จาก Mesh ของคุณ)
+                # หมายเหตุ: 'model' จะไปแบ่งที่มิติแรก (Index 0) ของตัวแปรนั้น
+                spec = jax.sharding.PartitionSpec("model")
+
+            # สร้าง NamedSharding ที่ถูกต้องตามเงื่อนไข
+            actual_sharding = jax.sharding.NamedSharding(mesh, spec)
+
+            return jax.ShapeDtypeStruct(
+                shape=leaf.shape, dtype=leaf.dtype, sharding=actual_sharding
+            )
+
+        # 3. Map ลงใน abs_state
+        abs_state = jax.tree.map(wrap_with_sharding, abs_state)
 
         ckpter = ocp.StandardCheckpointer()
         state = ckpter.restore(path, abs_state)
@@ -137,102 +214,93 @@ class LanguageModel:
 
         return model
 
-    def generate_(
-        self, 
-        input_ids: jax.Array, 
-        attention_mask: jax.Array, 
+    def generate(
+        self,
+        input_ids: jax.Array,
+        attention_mask: jax.Array,
         key: jax.Array | None = None,
-        max_new_tokens: int = 64, 
-        temperature: float = 1.0, 
-        top_p: float = 1.0, 
-        top_k: float = 1.0,
-        eos_token_id: int | None = None
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        repetition_penalty: float = 1.0,
+        eos_token_id: int | None = None,
     ):
         B, S = input_ids.shape
         max_len = S + max_new_tokens
-        
-        use_cache = getattr(self, "config", None) is None or getattr(self.config, "use_cache", True)
-        
-        if hasattr(self, 'init_cache') and use_cache:
+
+        cfg = getattr(self, "config", getattr(self, "kwargs", {}).get("config", None))
+        use_cache = True if cfg is None else getattr(cfg, "use_cache", True)
+
+        # Enforce use_cache on all submodules (like Attention) since checkpoint config
+        # might have use_cache=False and model.config.replace() doesn't update instances
+        from .cache import KVCacheBase
+
+        for _, module in nnx.iter_modules(self):
+            if isinstance(module, KVCacheBase) and hasattr(module, "use_cache"):
+                module.use_cache = use_cache
+
+        if attention_mask is None:
+            attention_mask = jnp.ones((B, S), dtype=jnp.bool_)
+        else:
+            attention_mask = attention_mask.astype(jnp.bool_)
+
+        if hasattr(self, "init_cache") and use_cache:
             self.init_cache(B, max_len)
 
         if key is None:
             temperature = 0.0
-            
+
         out_ids = jnp.zeros((B, max_len), dtype=jnp.int32)
-        out_ids = out_ids.at[:, :S].set(input_ids)
+        out_ids = out_ids.at[:, :S].set(input_ids.astype(jnp.int32))
         out_mask = jnp.zeros((B, max_len), dtype=jnp.bool_)
-        out_mask = out_mask.at[:, :S].set(attention_mask.astype(jnp.bool_))
-        
-        position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
-        position_ids = jnp.maximum(position_ids, 0)
-        
-        logits = self(input_ids, attention_mask, position_ids)
-        last_logit = logits[:, -1, :] # shape (B, V)
+        out_mask = out_mask.at[:, :S].set(attention_mask)
 
-        class GenerationState(nnx.Module):
-            def __init__(self, key, out_ids, out_mask, last_logit, finished):
-                self.key = nnx.Variable(key)
-                self.out_ids = nnx.Variable(out_ids)
-                self.out_mask = nnx.Variable(out_mask)
-                self.last_logit = nnx.Variable(last_logit)
-                self.finished = nnx.Variable(finished)
+        finished = jnp.zeros((B,), dtype=jnp.bool_)
 
-        self.gen_state = GenerationState(
-            key, out_ids, out_mask, last_logit, jnp.zeros((B,), dtype=jnp.bool_)
-        )
+        # Prefill on prompt
+        prompt_position_ids = jnp.cumsum(attention_mask.astype(jnp.int32), axis=-1) - 1
+        prompt_position_ids = jnp.maximum(prompt_position_ids, 0)
+        logits = _forward_step(self, input_ids, attention_mask, prompt_position_ids)
+        last_logit = logits[:, -1, :]  # shape (B, V)
 
-        @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-        def body(module, i):
-            if temperature == 0.0:
-                result = jax.lax.argmax(module.gen_state.last_logit.value, axis=1, index_dtype=jnp.int32)
-            else:
-                l_logit = module.gen_state.last_logit.value / temperature
-                module.gen_state.key.value, subkey = jax.random.split(module.gen_state.key.value)
-                result = jax.random.categorical(subkey, l_logit, axis=-1)
-                
-            result = result.astype(jnp.int32)
-            
+        for i in range(max_new_tokens):
+            cur_seq = out_ids[:, : S + i]
+            next_token, key = sample_token(
+                last_logit, cur_seq, key, temperature, top_k, top_p, repetition_penalty
+            )
+
             if eos_token_id is not None:
-                result = jnp.where(module.gen_state.finished.value, eos_token_id, result)
-                module.gen_state.finished.value = module.gen_state.finished.value | (result == eos_token_id)
-                
-            result = jnp.expand_dims(result, axis=1) # shape (B, 1)
+                next_token = jnp.where(finished, eos_token_id, next_token)
+                finished = finished | (next_token == eos_token_id)
 
-            # Insert next token into sequence and update mask
-            module.gen_state.out_ids.value = jax.lax.dynamic_update_slice(
-                module.gen_state.out_ids.value, result, (0, S + i)
+            next_token_2d = jnp.expand_dims(
+                next_token.astype(jnp.int32), axis=1
+            )  # (B, 1)
+
+            # Write generated token and mark mask as valid
+            out_ids = jax.lax.dynamic_update_slice(out_ids, next_token_2d, (0, S + i))
+            out_mask = jax.lax.dynamic_update_slice(
+                out_mask, jnp.ones((B, 1), dtype=jnp.bool_), (0, S + i)
             )
-            append_mask = jnp.ones((B, 1), dtype=jnp.bool_)
-            module.gen_state.out_mask.value = jax.lax.dynamic_update_slice(
-                module.gen_state.out_mask.value, append_mask, (0, S + i)
-            )
-            
-            # Static boolean subset slice trick
-            indices = jnp.arange(max_len)
-            valid_mask = indices <= (S + i)
-            static_mask = module.gen_state.out_mask.value & valid_mask
-            
+
             if use_cache:
-                # Forward pass for next token (single token)
-                next_position_ids = jnp.expand_dims(position_ids[:, -1] + 1 + i, axis=1)
-                logits = module(result, static_mask, next_position_ids)
-                module.gen_state.last_logit.value = logits[:, -1, :]
+                # Decode one token with cache using static shapes for JIT
+                decode_pos = (
+                    jnp.sum(out_mask.astype(jnp.int32), axis=-1, keepdims=True) - 1
+                )
+                logits = _forward_step(self, next_token_2d, out_mask, decode_pos)
+                last_logit = logits[:, -1, :]
             else:
-                # Forward pass for entire sequence so far
-                cur_position_ids = jnp.cumsum(static_mask, axis=-1) - 1
-                cur_position_ids = jnp.maximum(cur_position_ids, 0)
-                logits = module(module.gen_state.out_ids.value, static_mask, cur_position_ids)
-                
-                # Extract logit precisely at the newly generated token's sequence index
-                # index (S + i) is the token we just inserted, so we want logits from that step to predict the next
-                # Wait, module(ids) returns predictions. The token we just inserted is at S+i.
-                # So we want logits[:, S+i, :]
-                module.gen_state.last_logit.value = jax.lax.dynamic_slice(
-                    logits, (0, S + i, 0), (B, 1, logits.shape[-1])
-                )[:, 0, :]
-            
-            return module, jnp.ones((B,))
+                # Full forward pass without cache (cannot be trivially jitted due to dynamic shape)
+                cur_ids = out_ids[:, : S + i + 1]
+                cur_mask = out_mask[:, : S + i + 1]
+                cur_pos = jnp.cumsum(cur_mask.astype(jnp.int32), axis=-1) - 1
+                cur_pos = jnp.maximum(cur_pos, 0)
+                logits = self(cur_ids, cur_mask, cur_pos)
+                last_logit = logits[:, -1, :]
 
-        _, _ = body(self, jnp.arange(max_new_tokens))
-        return self.gen_state.out_ids.value
+            if eos_token_id is not None and jnp.all(finished):
+                break
+
+        return out_ids
