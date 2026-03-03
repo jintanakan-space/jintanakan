@@ -120,6 +120,12 @@ class Attention(KVCacheBase):
         if self.use_cache:
             key, value = self.update_cache(key, value)
 
+        # GQA: repeat KV heads to match query heads
+        if self.attention_head > self.kv_head:
+            num_groups = self.attention_head // self.kv_head
+            key = jnp.repeat(key, num_groups, axis=-2)
+            value = jnp.repeat(value, num_groups, axis=-2)
+
         if attention_mask is not None and key.shape[1] > attention_mask.shape[-1]:
             pad_len = key.shape[1] - attention_mask.shape[-1]
             attention_mask = jnp.pad(attention_mask, ((0,0), (0,0), (0,0), (0, pad_len)))

@@ -12,10 +12,12 @@ wheels/
 
 generate.py
 main.py
-train.py
+train*.py
 tokenizer/
 platform/
 ckpt/
+tiny-llama-ckpt/
+dummy-math-dataset/
 
 models/deepseek-based
 models/inc-per-token 
@@ -28,3 +30,7 @@ pipeline/
 
 
 test*
+
+NOTE.md
+
+create_tiny_ckpt.py

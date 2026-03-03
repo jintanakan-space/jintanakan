@@ -3,7 +3,6 @@ import functools
 import json
 from pathlib import Path
 
-import cloudpickle
 import jax
 import jax.numpy as jnp
 from flax import nnx, serialization
@@ -42,7 +41,7 @@ def apply_rope(query: jax.Array, key: jax.Array, cos: jax.Array, sin: jax.Array)
     jax.jit, static_argnames=("temperature", "top_k", "top_p", "repetition_penalty")
 )
 def sample_token(
-    logits, input_ids, key, temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0
+    logits, input_ids, input_mask, key, temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0
 ):
     if temperature == 0.0:
         return jax.lax.argmax(logits, axis=1, index_dtype=jnp.int32), key
@@ -51,7 +50,9 @@ def sample_token(
 
     # Repetition Penalty
     if repetition_penalty != 1.0:
-        score_mask = jax.nn.one_hot(input_ids, logits.shape[-1]).any(axis=1)
+        one_hots = jax.nn.one_hot(input_ids, logits.shape[-1])
+        valid_one_hots = jnp.where(jnp.expand_dims(input_mask, -1), one_hots, 0.0)
+        score_mask = valid_one_hots.any(axis=1)
         penalized_logits = jnp.where(
             logits > 0, logits / repetition_penalty, logits * repetition_penalty
         )
@@ -140,7 +141,7 @@ class LanguageModel:
             print(e)
 
     @classmethod
-    def load(cls, path: str | Path):
+    def load(cls, path: str | Path, dtype=None):
         if isinstance(path, str):
             path = Path(path)
 
@@ -210,6 +211,16 @@ class LanguageModel:
         ckpter = ocp.StandardCheckpointer()
         state = ckpter.restore(path, abs_state)
         ckpter.wait_until_finished()
+
+        # Cast to target dtype if specified (e.g. bf16 checkpoint → float16 for T4 GPU)
+        if dtype is not None:
+            target_dtype = get_dtype(dtype) if isinstance(dtype, str) else dtype
+            def _cast(x):
+                if hasattr(x, "dtype") and x.dtype != target_dtype and jnp.issubdtype(x.dtype, jnp.floating):
+                    return x.astype(target_dtype)
+                return x
+            state = jax.tree.map(_cast, state)
+
         model = nnx.merge(gdef, state)
 
         return model
@@ -250,6 +261,7 @@ class LanguageModel:
 
         if key is None:
             temperature = 0.0
+            key = jax.random.key(0)
 
         out_ids = jnp.zeros((B, max_len), dtype=jnp.int32)
         out_ids = out_ids.at[:, :S].set(input_ids.astype(jnp.int32))
@@ -264,43 +276,41 @@ class LanguageModel:
         logits = _forward_step(self, input_ids, attention_mask, prompt_position_ids)
         last_logit = logits[:, -1, :]  # shape (B, V)
 
+        # Decode loop — each step dispatches a JIT-compiled forward pass to device
         for i in range(max_new_tokens):
-            cur_seq = out_ids[:, : S + i]
             next_token, key = sample_token(
-                last_logit, cur_seq, key, temperature, top_k, top_p, repetition_penalty
+                last_logit, out_ids, out_mask,
+                key, temperature, top_k, top_p, repetition_penalty
             )
 
             if eos_token_id is not None:
                 next_token = jnp.where(finished, eos_token_id, next_token)
                 finished = finished | (next_token == eos_token_id)
 
-            next_token_2d = jnp.expand_dims(
-                next_token.astype(jnp.int32), axis=1
-            )  # (B, 1)
+            next_token_2d = jnp.expand_dims(next_token.astype(jnp.int32), axis=1)
 
             # Write generated token and mark mask as valid
-            out_ids = jax.lax.dynamic_update_slice(out_ids, next_token_2d, (0, S + i))
-            out_mask = jax.lax.dynamic_update_slice(
-                out_mask, jnp.ones((B, 1), dtype=jnp.bool_), (0, S + i)
-            )
+            out_ids = out_ids.at[:, S + i].set(next_token.astype(jnp.int32))
+            out_mask = out_mask.at[:, S + i].set(True)
+
+            # Masking for next forward pass
+            indices = jnp.arange(max_len)
+            valid_mask = indices <= (S + i)
+            static_mask = out_mask & valid_mask
 
             if use_cache:
-                # Decode one token with cache using static shapes for JIT
-                decode_pos = (
-                    jnp.sum(out_mask.astype(jnp.int32), axis=-1, keepdims=True) - 1
+                decode_pos = jnp.expand_dims(
+                    jnp.sum(static_mask.astype(jnp.int32), axis=-1) - 1, axis=-1
                 )
-                logits = _forward_step(self, next_token_2d, out_mask, decode_pos)
+                logits = _forward_step(self, next_token_2d, static_mask, decode_pos)
                 last_logit = logits[:, -1, :]
             else:
-                # Full forward pass without cache (cannot be trivially jitted due to dynamic shape)
-                cur_ids = out_ids[:, : S + i + 1]
-                cur_mask = out_mask[:, : S + i + 1]
-                cur_pos = jnp.cumsum(cur_mask.astype(jnp.int32), axis=-1) - 1
+                cur_pos = jnp.cumsum(static_mask.astype(jnp.int32), axis=-1) - 1
                 cur_pos = jnp.maximum(cur_pos, 0)
-                logits = self(cur_ids, cur_mask, cur_pos)
-                last_logit = logits[:, -1, :]
-
-            if eos_token_id is not None and jnp.all(finished):
-                break
+                logits = _forward_step(self, out_ids, static_mask, cur_pos)
+                last_logit = jax.lax.dynamic_slice(
+                    logits, (0, S + i, 0), (B, 1, logits.shape[-1])
+                )[:, 0, :]
 
         return out_ids
+
